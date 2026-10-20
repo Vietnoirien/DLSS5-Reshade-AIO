@@ -76,14 +76,14 @@ The x86 package supports native 32-bit D3D9 and D3D11 output. ReShade 6 presents
 
 ## Linux / Proton (Wine)
 
-This fork supports **64-bit D3D11 games under Wine or Proton** (tested with GE-Proton 11 in Bottles, DXVK 3.1, VKD3D-Proton and DXVK-NVAPI, RTX 5070, NVIDIA driver 615.71).
+This fork supports **64-bit D3D11 games under Wine or Proton** with DXVK, VKD3D-Proton and DXVK-NVAPI on an NVIDIA RTX GPU.
 
 Under Wine, the 2.x presenters cannot work: DXVK implements neither `IDXGIFactory2::CreateSwapChainForComposition` nor DirectComposition, so the addon processes every frame but has nowhere to show it. **Write-back presentation** copies each finished NR/DLSS frame into the game's own backbuffer at Present instead. ReShade effects and the ReShade menu are then drawn on top of it as usual. It turns on automatically when the addon detects Wine (`ntdll` exports `wine_get_version`) and is listed under **Compatibility / troubleshooting** as **Write processed output into the game image (D3D11, Wine/Proton)**. Set `WritebackPresentation=1` or `0` under `[Standalone.DLSSNR]` to force it on or off.
 
 Setup in addition to the normal 64-bit install:
 
 1. Install ReShade as `dxgi.dll` beside the game executable. A DXVK prefix already sets `dxgi` to `native,builtin`, so no extra DLL override is needed.
-2. Make sure the prefix has a real `d3dcompiler_47.dll`. Prefixes created by other launchers can contain a symlink into a folder the Flatpak sandbox cannot see. If ReShade crashes with `0xc06d007e` or the addon fails to load with error 126, copy Microsoft's `d3dcompiler_47.dll` beside the game executable.
+2. Make sure the prefix has a real `d3dcompiler_47.dll`, not a symlink that is broken inside the launcher's sandbox. If ReShade crashes with `0xc06d007e` or the addon fails to load with error 126, copy Microsoft's `d3dcompiler_47.dll` beside the game executable.
 3. The addon finds the NVIDIA NGX core only inside a Windows DriverStore package. Create one for the Wine driver files, and refresh it after every NVIDIA driver update:
 
    ```bash
@@ -101,7 +101,7 @@ Setup in addition to the normal 64-bit install:
 Known limits under Wine:
 
 - DXVK-NVAPI's Optical Flow lacks formats the addon requires, so motion uses the zero-motion fallback. Moving scenes can look softer than on Windows.
-- The game's D3D12 mode (`-force-d3d12` in Unity) is not a workaround: it can break the game's own shaders.
+- Forcing a D3D11 game into D3D12 (for example with an engine command-line switch) is not a workaround: it can break the game's own shaders.
 - The log records write-back pipeline counters every five seconds (`write-back stats`). `taken` close to `presents` means every game frame is being replaced by its processed version. `generated` counts DLSS-G frames shown. High `unfinished` means NGX work is still on the GPU when the next Present looks. High `copy_busy` or `read_busy` means the copy textures are the bottleneck.
 
 ## First-launch setup
