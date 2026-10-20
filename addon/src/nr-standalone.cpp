@@ -11700,9 +11700,12 @@ static bool OnReshadeOpenOverlay(reshade::api::effect_runtime *runtime, bool ope
     return false;
 }
 
-// D3D11 write-back presentation. Two shared D3D12/D3D11 textures carry the
-// newest finished output into the game backbuffer: D3D12 copies into the back
-// texture while D3D11 shows the front one. Neither API ever waits on the
+// D3D11 write-back presentation. Three shared D3D12/D3D11 textures carry the
+// newest finished output into the game backbuffer: D3D12 copies into a back
+// texture while D3D11 shows the front one. DXVK's D3D11 queue completes reads
+// two or three Presents late, so with only two textures the one just retired
+// from the front would still be in use and a new frame could land only every
+// third Present; the third texture is the one shown longest ago. Neither API ever waits on the
 // other's queue. Each side polls the other's fence on the CPU and acts only on
 // completed work, so no cross-API dependency can deadlock the GPU. (A GPU wait
 // from DXVK's D3D11 queue applies to its whole submission, which may also hold
@@ -11714,8 +11717,13 @@ struct WritebackBuffer
     UINT64 copy_value = 0;  // D3D12 copy into this texture
     UINT64 read_value = 0;  // newest D3D11 copy out of this texture
     int slot = -1;          // presentation slot read by the in-flight copy
+    // DLSS-G frame interpolated between the previous real frame and this one.
+    Microsoft::WRL::ComPtr<ID3D12Resource> generated12;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> generated11;
+    bool has_generated = false;
 };
-static WritebackBuffer g_writeback_buffers[2];
+static constexpr int kWritebackBufferCount = 3;
+static WritebackBuffer g_writeback_buffers[kWritebackBufferCount];
 static int g_writeback_front = -1;
 static Microsoft::WRL::ComPtr<ID3D12Fence> g_writeback_copy_fence;
 static Microsoft::WRL::ComPtr<ID3D11Fence> g_writeback_read_fence;
@@ -11729,6 +11737,14 @@ static UINT g_writeback_height;
 static DXGI_FORMAT g_writeback_format = DXGI_FORMAT_UNKNOWN;
 static ULONGLONG g_writeback_frame_tick;
 static bool g_writeback_has_frame;
+// Frame generation: the front frame's generated image is shown once, through
+// an extra native Present, half a frame before its real image.
+static bool g_writeback_with_generated;
+static bool g_writeback_generated_pending;
+static bool g_writeback_fg_failed;
+static LARGE_INTEGER g_writeback_last_present_qpc;
+static double g_writeback_interval_us;
+static unsigned long long g_writeback_generated_shown;
 // Past this age the last processed frame is no longer shown, so a stalled or
 // disabled pipeline falls back to the live game image instead of freezing it.
 static constexpr ULONGLONG kWritebackStaleMs = 250;
@@ -11766,19 +11782,25 @@ static void ReleaseWritebackResources()
     g_writeback_width = g_writeback_height = 0;
     g_writeback_format = DXGI_FORMAT_UNKNOWN;
     g_writeback_has_frame = false;
+    g_writeback_with_generated = false;
+    g_writeback_generated_pending = false;
 }
 
 static bool EnsureWritebackResources(UINT width, UINT height, DXGI_FORMAT format)
 {
+    const bool with_generated = EffectiveFramegenEnabled() && !g_framegen_failed && !g_writeback_fg_failed;
     if (g_writeback_list && g_writeback_copy_fence && g_writeback_read_fence &&
-        g_writeback_buffers[1].resource11 &&
+        g_writeback_buffers[kWritebackBufferCount - 1].resource11 &&
+        g_writeback_with_generated == with_generated &&
         width == g_writeback_width && height == g_writeback_height && format == g_writeback_format)
         return true;
     ReleaseWritebackResources();
     if (!g_neural_device || !g_legacy_device11 || !g_legacy_context4 || !g_command_queue) return false;
     for (WritebackBuffer &buffer : g_writeback_buffers)
     {
-        if (!CreateSharedPair11(width, height, format, buffer.resource12, buffer.resource11))
+        if (!CreateSharedPair11(width, height, format, buffer.resource12, buffer.resource11) ||
+            (with_generated &&
+                !CreateSharedPair11(width, height, format, buffer.generated12, buffer.generated11)))
         {
             ReleaseWritebackResources();
             return false;
@@ -11806,7 +11828,10 @@ static bool EnsureWritebackResources(UINT width, UINT height, DXGI_FORMAT format
     g_writeback_width = width;
     g_writeback_height = height;
     g_writeback_format = format;
-    Log("write-back resources ready: 2x %ux%u fmt=%u", width, height, static_cast<unsigned int>(format));
+    g_writeback_with_generated = with_generated;
+    Log("write-back resources ready: %dx %ux%u fmt=%u%s", kWritebackBufferCount, width, height,
+        static_cast<unsigned int>(format),
+        with_generated ? " with frame generation" : "");
     return true;
 }
 
@@ -11816,6 +11841,14 @@ static int TakeWritebackCandidate()
 {
     if (!g_neural_fence) return -1;
     const UINT64 completed = g_neural_fence->GetCompletedValue();
+    const UINT64 fg_completed = g_async_fg_fence ? g_async_fg_fence->GetCompletedValue() : 0;
+    // A slot is ready once NGX wrote its real image and, when it has one,
+    // DLSS-G its generated image.
+    auto finished = [&](int slot) {
+        const PresentationFrameSlot &frame = g_presentation_slots[slot];
+        return completed >= frame.neural_fence_value &&
+            (!frame.has_generated_frame || frame.fg_fence_value == 0 || fg_completed >= frame.fg_fence_value);
+    };
     int taken = -1;
     int superseded[kWritebackPublishedSlots];
     int superseded_count = 0;
@@ -11828,7 +11861,7 @@ static int TakeWritebackCandidate()
         any_published = true;
         if (taken < 0)
         {
-            if (completed < g_presentation_slots[slot].neural_fence_value) continue;
+            if (!finished(slot)) continue;
             taken = slot;
         }
         else
@@ -11870,17 +11903,27 @@ static bool CopyWritebackCandidate(ID3D11Texture2D *backbuffer, WritebackBuffer 
         FAILED(g_writeback_list->Reset(g_writeback_allocator.Get(), nullptr)))
         return false;
     ID3D12Resource *destination = buffer.resource12.Get();
-    const D3D12_RESOURCE_BARRIER begin[2] = {
+    ID3D12Resource *generated = g_presentation_slots[index].generated_output.Get();
+    const bool copy_generated = g_writeback_with_generated && buffer.generated12 && generated &&
+        g_presentation_slots[index].has_generated_frame;
+    const D3D12_RESOURCE_BARRIER begin[4] = {
         Transition(source, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
         Transition(destination, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
+        Transition(generated, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        Transition(buffer.generated12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
     };
-    const D3D12_RESOURCE_BARRIER end[2] = {
+    const D3D12_RESOURCE_BARRIER end[4] = {
         Transition(source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
         Transition(destination, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON),
+        Transition(generated, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+        Transition(buffer.generated12.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON),
     };
-    g_writeback_list->ResourceBarrier(2, begin);
+    const UINT barrier_count = copy_generated ? 4u : 2u;
+    g_writeback_list->ResourceBarrier(barrier_count, begin);
     g_writeback_list->CopyResource(destination, source);
-    g_writeback_list->ResourceBarrier(2, end);
+    if (copy_generated) g_writeback_list->CopyResource(buffer.generated12.Get(), generated);
+    g_writeback_list->ResourceBarrier(barrier_count, end);
+    buffer.has_generated = copy_generated;
     if (FAILED(g_writeback_list->Close())) return false;
     ID3D12CommandList *lists[] = { g_writeback_list.Get() };
     g_command_queue->ExecuteCommandLists(1, lists);
@@ -11901,11 +11944,62 @@ static bool CopyWritebackCandidate(ID3D11Texture2D *backbuffer, WritebackBuffer 
 // Called from the D3D11 Present path after the frame has been captured for
 // NGX, so the capture always reads the game's own image. ReShade effects and
 // the overlay are drawn after this event, on top of the processed frame.
-static void WritebackPresentedFrame(reshade::api::resource backbuffer_resource)
+// Shows the front frame's generated image through an extra native Present and
+// waits until half a frame later, so the caller's real image follows evenly.
+// The native swapchain is ReShade's wrapped object, so this does not re-enter
+// ReShade's own Present handling.
+static void PresentWritebackGeneratedFrame(reshade::api::swapchain *swapchain,
+    ID3D11Texture2D *backbuffer, WritebackBuffer &front)
+{
+    auto *native = swapchain ? reinterpret_cast<IDXGISwapChain *>(swapchain->get_native()) : nullptr;
+    if (native == nullptr) return;
+    g_legacy_context11->CopyResource(backbuffer, front.generated11.Get());
+    LARGE_INTEGER presented = {}, frequency = {};
+    QueryPerformanceFrequency(&frequency);
+    const HRESULT hr = native->Present(0, 0);
+    QueryPerformanceCounter(&presented);
+    if (FAILED(hr))
+    {
+        g_writeback_fg_failed = true;
+        Log("write-back generated-frame Present failed: 0x%08X; frame generation write-back disabled",
+            static_cast<unsigned int>(hr));
+        return;
+    }
+    ++g_writeback_generated_shown;
+    static std::atomic<bool> logged_first_generated{false};
+    if (!logged_first_generated.exchange(true, std::memory_order_acq_rel))
+        Log("write-back frame generation active: generated frames are presented between real frames");
+    // Half the measured real-frame interval, bounded so a slow frame cannot
+    // stall the game thread for long.
+    const double wait_us = std::clamp(g_writeback_interval_us * 0.5, 0.0, 25000.0);
+    const LONGLONG target = presented.QuadPart +
+        static_cast<LONGLONG>(wait_us * static_cast<double>(frequency.QuadPart) / 1000000.0);
+    for (LARGE_INTEGER now = presented; now.QuadPart < target; QueryPerformanceCounter(&now))
+    {
+        const double remaining_us = static_cast<double>(target - now.QuadPart) * 1000000.0 /
+            static_cast<double>(frequency.QuadPart);
+        if (remaining_us > 1500.0) Sleep(1);
+        else YieldProcessor();
+    }
+}
+
+static void WritebackPresentedFrame(reshade::api::swapchain *swapchain, reshade::api::resource backbuffer_resource)
 {
     if (!g_writeback_presentation || g_writeback_failed || !g_legacy_context4 || !g_command_queue) return;
     auto *backbuffer = reinterpret_cast<ID3D11Texture2D *>(backbuffer_resource.handle);
     if (backbuffer == nullptr) return;
+    // Smoothed real-frame interval, used to pace generated frames.
+    LARGE_INTEGER present_now = {};
+    QueryPerformanceCounter(&present_now);
+    if (g_writeback_last_present_qpc.QuadPart != 0)
+    {
+        const double interval_us = static_cast<double>(
+            CounterDeltaMicroseconds(g_writeback_last_present_qpc, present_now));
+        if (interval_us > 0.0 && interval_us < 250000.0)
+            g_writeback_interval_us = g_writeback_interval_us == 0.0 ? interval_us :
+                g_writeback_interval_us * 0.9 + interval_us * 0.1;
+    }
+    g_writeback_last_present_qpc = present_now;
     // The NGX device appears a few Presents after the swapchain; nothing can
     // be written back before then, and that is not a failure.
     if (!g_neural_device || !g_legacy_device11) return;
@@ -11922,7 +12016,7 @@ static void WritebackPresentedFrame(reshade::api::resource backbuffer_resource)
 
     // Promote a finished copy to the front and return its source slot.
     const UINT64 copies_done = g_writeback_copy_fence->GetCompletedValue();
-    for (int index = 0; index < 2; ++index)
+    for (int index = 0; index < kWritebackBufferCount; ++index)
     {
         WritebackBuffer &buffer = g_writeback_buffers[index];
         if (buffer.slot < 0 || buffer.copy_value == 0 || copies_done < buffer.copy_value) continue;
@@ -11934,6 +12028,7 @@ static void WritebackPresentedFrame(reshade::api::resource backbuffer_resource)
         buffer.slot = -1;
         ++g_writeback_promoted;
         g_writeback_front = index;
+        g_writeback_generated_pending = buffer.has_generated;
         g_writeback_has_frame = true;
         g_writeback_frame_tick = GetTickCount64();
         UpdateOutputFps();
@@ -11943,11 +12038,21 @@ static void WritebackPresentedFrame(reshade::api::resource backbuffer_resource)
                 static_cast<unsigned int>(g_writeback_format));
     }
 
-    // Copy the newest finished output into the back texture once D3D11 has
-    // finished reading it and no other copy is in flight (one allocator).
-    WritebackBuffer &back = g_writeback_buffers[g_writeback_front == 0 ? 1 : 0];
-    const bool copy_idle = g_writeback_buffers[0].slot < 0 && g_writeback_buffers[1].slot < 0;
-    const bool read_done = g_writeback_read_fence->GetCompletedValue() >= back.read_value;
+    // Copy the newest finished output into a back texture whose D3D11 reads
+    // have completed, preferring the one read longest ago, once no other copy
+    // is in flight (one allocator).
+    bool copy_idle = true;
+    for (const WritebackBuffer &buffer : g_writeback_buffers)
+        if (buffer.slot >= 0) copy_idle = false;
+    const UINT64 reads_done = g_writeback_read_fence->GetCompletedValue();
+    WritebackBuffer *back = nullptr;
+    for (int index = 0; index < kWritebackBufferCount; ++index)
+    {
+        WritebackBuffer &buffer = g_writeback_buffers[index];
+        if (index == g_writeback_front || reads_done < buffer.read_value) continue;
+        if (back == nullptr || buffer.read_value < back->read_value) back = &buffer;
+    }
+    const bool read_done = back != nullptr;
     ++g_writeback_presents;
     if (!copy_idle) ++g_writeback_copy_busy;
     else if (!read_done) ++g_writeback_read_busy;
@@ -11955,10 +12060,11 @@ static void WritebackPresentedFrame(reshade::api::resource backbuffer_resource)
     if (g_writeback_stats_tick == 0) g_writeback_stats_tick = stats_now;
     else if (stats_now - g_writeback_stats_tick >= 5000)
     {
-        Log("write-back stats (5s): presents=%llu published=%llu taken=%llu unfinished=%llu empty=%llu copy_busy=%llu read_busy=%llu shown_new=%llu",
+        Log("write-back stats (5s): presents=%llu published=%llu taken=%llu unfinished=%llu empty=%llu copy_busy=%llu read_busy=%llu shown_new=%llu generated=%llu",
             g_writeback_presents, g_writeback_published.exchange(0), g_writeback_taken,
             g_writeback_unfinished, g_writeback_empty, g_writeback_copy_busy,
-            g_writeback_read_busy, g_writeback_promoted);
+            g_writeback_read_busy, g_writeback_promoted, g_writeback_generated_shown);
+        g_writeback_generated_shown = 0;
         g_writeback_presents = g_writeback_taken = g_writeback_unfinished = g_writeback_empty = 0;
         g_writeback_copy_busy = g_writeback_read_busy = g_writeback_promoted = 0;
         g_writeback_stats_tick = stats_now;
@@ -11966,7 +12072,7 @@ static void WritebackPresentedFrame(reshade::api::resource backbuffer_resource)
     if (copy_idle && read_done)
     {
         const int candidate = TakeWritebackCandidate();
-        if (candidate >= 0 && !CopyWritebackCandidate(backbuffer, back, candidate))
+        if (candidate >= 0 && !CopyWritebackCandidate(backbuffer, *back, candidate))
             ReleaseWritebackPresentationSlot(candidate);
     }
 
@@ -11974,6 +12080,16 @@ static void WritebackPresentedFrame(reshade::api::resource backbuffer_resource)
         GetTickCount64() - g_writeback_frame_tick > kWritebackStaleMs)
         return;
     WritebackBuffer &front = g_writeback_buffers[g_writeback_front];
+    // The generated image goes out once per new frame. It is skipped while the
+    // ReShade menu is open, since only the real frame carries the overlay.
+    if (g_writeback_generated_pending)
+    {
+        g_writeback_generated_pending = false;
+        if (front.has_generated && front.generated11 && !g_writeback_fg_failed &&
+            EffectiveFramegenEnabled() && !g_framegen_failed &&
+            !g_reshade_overlay_open.load(std::memory_order_acquire))
+            PresentWritebackGeneratedFrame(swapchain, backbuffer, front);
+    }
     g_legacy_context11->CopyResource(backbuffer, front.resource11.Get());
     const UINT64 read_value = ++g_writeback_read_counter;
     if (SUCCEEDED(g_legacy_context4->Signal(g_writeback_read_fence.Get(), read_value)))
@@ -11991,8 +12107,9 @@ static void WritebackPresentedFrame(reshade::api::resource backbuffer_resource)
 // capture branches it took.
 struct WritebackPresentScope
 {
+    reshade::api::swapchain *swapchain = nullptr;
     reshade::api::resource backbuffer = { 0 };
-    ~WritebackPresentScope() { if (backbuffer.handle != 0) WritebackPresentedFrame(backbuffer); }
+    ~WritebackPresentScope() { if (backbuffer.handle != 0) WritebackPresentedFrame(swapchain, backbuffer); }
 };
 
 static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain,
@@ -12377,7 +12494,11 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     else if (api == reshade::api::device_api::d3d11 || api == reshade::api::device_api::d3d9)
     {
         WritebackPresentScope writeback;
-        if (api == reshade::api::device_api::d3d11) writeback.backbuffer = backbuffer_resource;
+        if (api == reshade::api::device_api::d3d11)
+        {
+            writeback.swapchain = swapchain;
+            writeback.backbuffer = backbuffer_resource;
+        }
         const auto desc = swapchain->get_device()->get_resource_desc(backbuffer_resource);
         const UINT width = static_cast<UINT>(desc.texture.width);
         const UINT height = desc.texture.height;

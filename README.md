@@ -94,13 +94,15 @@ Setup in addition to the normal 64-bit install:
 
    Without it, the log reports `NGX core: no NVIDIA DriverStore packages matched` and `standalone pipeline FAILED at driver NGX core exports`.
 4. Keep the game in **fullscreen window / borderless** at native resolution. Write-back requires the processed output to match the backbuffer size; Wine cannot switch display modes, so reduced exclusive-fullscreen requests fall back to native anyway. Use **Pipeline source resolution override** (for example *Cap at 720p* or *Cap at 1080p*) to keep NR cheap. DLSS SR then reconstructs the native-size output.
-5. Disable addon **Frame Generation**; generated frames are not written back.
+5. On GNOME with fractional scaling, check what Xwayland reports with `xrandr`. With the experimental `xwayland-native-scaling` feature, a 2560x1440 monitor at 125% appears to X11 apps as 4096x2304, so Wine renders the game, NR, DLSS and FG at 2.56 times the panel's pixels, and GNOME then shrinks the result. Set every monitor to 100% while playing (Settings > Displays > *monitor* > Scale), because Xwayland uses one scale for all monitors.
+
+**Frame Generation** also works with write-back. When a new processed frame arrives, its DLSS-G frame is written into the backbuffer and shown with an extra Present on the game's native (unwrapped) swapchain. The real frame follows half a measured frame interval later through the game's own Present. Generated frames are skipped while the ReShade menu is open, because only the real frame carries the overlay. Expect about half a frame of extra latency. With FG enabled, the addon processes every second game frame and pairs each with a generated one.
 
 Known limits under Wine:
 
 - DXVK-NVAPI's Optical Flow lacks formats the addon requires, so motion uses the zero-motion fallback. Moving scenes can look softer than on Windows.
 - The game's D3D12 mode (`-force-d3d12` in Unity) is not a workaround: it can break the game's own shaders.
-- The log records write-back pipeline counters every five seconds (`write-back stats`). `taken` close to `presents` means every game frame is being replaced by its processed version.
+- The log records write-back pipeline counters every five seconds (`write-back stats`). `taken` close to `presents` means every game frame is being replaced by its processed version. `generated` counts DLSS-G frames shown. High `unfinished` means NGX work is still on the GPU when the next Present looks. High `copy_busy` or `read_busy` means the copy textures are the bottleneck.
 
 ## First-launch setup
 
