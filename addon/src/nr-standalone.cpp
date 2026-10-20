@@ -1,3 +1,5 @@
+// Modified in the Vietnoirien/DLSS5-Reshade-AIO fork (2026): adds D3D11
+// write-back presentation for Wine/Proton. See README "Linux / Proton (Wine)".
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>

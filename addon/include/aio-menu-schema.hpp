@@ -1,3 +1,5 @@
+// Modified in the Vietnoirien/DLSS5-Reshade-AIO fork (2026): adds D3D11
+// write-back presentation for Wine/Proton. See README "Linux / Proton (Wine)".
 #pragma once
 
 #include <cstddef>
