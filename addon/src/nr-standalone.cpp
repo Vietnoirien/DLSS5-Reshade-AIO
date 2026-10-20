@@ -349,6 +349,32 @@ static bool g_windowed_input_scaling;
 static bool g_dpi_physical_output_correction;
 static bool g_detached_presentation;
 static std::atomic<bool> g_auto_detached_presentation_active{false};
+// D3D11 write-back presentation: copy the newest finished output into the
+// game's own backbuffer instead of presenting through a proxy compositor.
+// Wine/Proton (DXVK) implement neither DirectComposition nor
+// CreateSwapChainForComposition, so this is the only visible output there.
+static bool g_writeback_presentation;
+static bool g_writeback_auto_wine;
+// The newest published slots, oldest first. On a saturated GPU a frame needs
+// more than one Present to finish, so the newest is usually still being
+// written by NGX; keeping a few lets each Present show the newest *finished*
+// frame instead of starving behind ever-replaced unfinished ones. Published
+// slots include NGX frames still in flight, so three of them plus one being
+// copied leave a presentation slot for the next NGX frame.
+static constexpr int kWritebackPublishedSlots = 3;
+static SRWLOCK g_writeback_slot_lock = SRWLOCK_INIT;
+static int g_writeback_published_slots[kWritebackPublishedSlots] = { -1, -1, -1 };
+// Write-back pipeline counters, logged every few seconds.
+static std::atomic<unsigned long long> g_writeback_published{0};
+static unsigned long long g_writeback_taken;
+static unsigned long long g_writeback_unfinished;
+static unsigned long long g_writeback_empty;
+static unsigned long long g_writeback_copy_busy;
+static unsigned long long g_writeback_read_busy;
+static unsigned long long g_writeback_promoted;
+static unsigned long long g_writeback_presents;
+static ULONGLONG g_writeback_stats_tick;
+static bool g_writeback_failed;
 static bool g_hide_detached_system_cursor;
 static std::atomic<unsigned int> g_auto_detached_center_warps{0};
 static std::atomic<unsigned long long> g_auto_detached_last_center_warp_tick{0};
@@ -435,6 +461,13 @@ static bool WindowedInputScalingEnabled()
 static bool DetachedPresentationEnabled()
 {
     return g_detached_presentation || g_auto_detached_presentation_active.load();
+}
+
+// Wine and Proton export wine_get_version from ntdll; Windows does not.
+static bool RunningUnderWine()
+{
+    const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    return ntdll != nullptr && GetProcAddress(ntdll, "wine_get_version") != nullptr;
 }
 
 static bool DetachedCursorHidden()
@@ -1210,6 +1243,7 @@ static NgxBridgeReleaseFeature g_bridge_release;
 static NgxBridgePopulateParameters g_bridge_populate;
 
 static void ReleaseLegacyFrameResources();
+static void ReleaseWritebackResources();
 static bool EnsureStandaloneResources(ID3D12Resource *backbuffer);
 static void UpdateProxyCursorClip(bool active);
 static bool EnsureSecondNrStage();
@@ -2216,7 +2250,10 @@ static LONGLONG AsyncFgDeadlineIntervalQpc()
 
 static bool DirectOutputHandoffEnabled()
 {
-    return g_async_compute_active && g_proxy_explicit_pacing_active &&
+    // Write-back has no proxy to pace, but consumes the same presentation
+    // slots that direct handoff provides.
+    return g_async_compute_active &&
+        (g_proxy_explicit_pacing_active || g_writeback_presentation) &&
         !g_synchronous_proxy_presentation;
 }
 
@@ -2495,6 +2532,25 @@ static void ReclaimPresentationFrameSlots()
         }
     }
     if (reclaimed && g_neural_dispatch_wake_event)
+        SetEvent(g_neural_dispatch_wake_event);
+}
+
+// Write-back keeps a finished slot in the Ready state while it waits to be
+// copied (and while that copy is in flight), then returns it here. Ready slots
+// are never touched by ReclaimPresentationFrameSlots, and no proxy worker runs
+// in write-back mode.
+static void ReleaseWritebackPresentationSlot(int index)
+{
+    if (index < 0 || index >= static_cast<int>(kPresentationFrameSlotCount)) return;
+    PresentationFrameSlot &slot = g_presentation_slots[index];
+    ConsumeAsyncFgTelemetry(slot);
+    slot.fence_value = 0;
+    slot.neural_fence_value = 0;
+    slot.fg_fence_value = 0;
+    slot.fg_telemetry_pending = false;
+    unsigned int expected = PresentationSlotReady;
+    if (slot.state.compare_exchange_strong(expected, PresentationSlotFree,
+            std::memory_order_acq_rel, std::memory_order_acquire) && g_neural_dispatch_wake_event)
         SetEvent(g_neural_dispatch_wake_event);
 }
 
@@ -4068,6 +4124,7 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
 
 static void ReleaseLegacyFrameResources()
 {
+    ReleaseWritebackResources();
     if (g_vulkan.ok)
     {
         if (g_vulkan_input != VK_NULL_HANDLE) g_vulkan.DestroyImage(g_vulkan.dev, g_vulkan_input, nullptr);
@@ -9750,7 +9807,8 @@ static bool ApplyPendingColorProfileChange(UINT width, UINT height, DXGI_FORMAT 
 
 static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
 {
-    if ((!early && source == nullptr) || g_command_queue == nullptr || g_game_window == nullptr)
+    if ((!early && source == nullptr) || g_command_queue == nullptr || g_game_window == nullptr ||
+        g_writeback_presentation)
         return false;
 
     // Creating an output swapchain can re-enter ReShade's Present callbacks on
@@ -10164,11 +10222,21 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
 
 static bool EnsureProxy(ID3D12Resource *source)
 {
-    if (source == nullptr || g_command_queue == nullptr || g_game_window == nullptr || g_proxy_failed)
+    if (source == nullptr || g_command_queue == nullptr || g_game_window == nullptr || g_proxy_failed ||
+        g_writeback_presentation)
         return false;
     if (g_proxy_swapchain != nullptr)
         return true;
     return InitializeProxyPresentation(source, false);
+}
+
+// Whether a finished frame has somewhere to go: the proxy presenter, or the
+// game backbuffer in write-back mode.
+static bool PresentationTargetReady(ID3D12Resource *source)
+{
+    if (g_writeback_presentation)
+        return source != nullptr && g_command_queue != nullptr && !g_writeback_failed;
+    return EnsureProxy(source);
 }
 
 static void OnInitCommandQueue(reshade::api::command_queue *queue)
@@ -10934,6 +11002,49 @@ static DWORD WINAPI ProxyPresentationThread(void *)
     return 0;
 }
 
+// Write-back counterpart of PublishDirectOutputSlot: instead of waking the
+// proxy presenter, park the finished slot as the newest write-back candidate.
+// OnPresent copies it into the game backbuffer once its neural fence passes.
+static bool PublishWritebackOutputSlot(PipelineFrameSlot &slot, int direct_slot_index)
+{
+    PresentationFrameSlot &direct_slot = g_presentation_slots[direct_slot_index];
+    if (g_sr_frames.load() == 0 || direct_slot.real_output == nullptr)
+    {
+        slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
+        return false;
+    }
+    ++g_proxy_present_requests;
+
+    unsigned int pipeline_expected = PipelineSlotReady;
+    if (!slot.state.compare_exchange_strong(pipeline_expected, PipelineSlotPresentRecording,
+            std::memory_order_acq_rel, std::memory_order_acquire))
+        return false;
+    if (direct_slot.state.load(std::memory_order_acquire) != PresentationSlotNeuralRecording)
+    {
+        slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
+        return false;
+    }
+    direct_slot.state.store(PresentationSlotReady, std::memory_order_release);
+    slot.presentation_slot_index = -1;
+    slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
+
+    // Keep the newest few frames; anything older is never shown.
+    AcquireSRWLockExclusive(&g_writeback_slot_lock);
+    const int dropped = g_writeback_published_slots[0];
+    for (int index = 1; index < kWritebackPublishedSlots; ++index)
+        g_writeback_published_slots[index - 1] = g_writeback_published_slots[index];
+    g_writeback_published_slots[kWritebackPublishedSlots - 1] = direct_slot_index;
+    ReleaseSRWLockExclusive(&g_writeback_slot_lock);
+    if (dropped >= 0 && dropped != direct_slot_index)
+        ReleaseWritebackPresentationSlot(dropped);
+    ++g_writeback_published;
+
+    static std::atomic<bool> logged_writeback_output{false};
+    if (!logged_writeback_output.exchange(true, std::memory_order_acq_rel))
+        Log("write-back output handoff active: finished frames are copied into the game backbuffer");
+    return true;
+}
+
 static bool PublishDirectOutputSlot(int slot_index)
 {
     if (slot_index < 0 || slot_index >= static_cast<int>(kPipelineFrameSlotCount)) return false;
@@ -10942,6 +11053,8 @@ static bool PublishDirectOutputSlot(int slot_index)
     if (direct_slot_index < 0 ||
         direct_slot_index >= static_cast<int>(kPresentationFrameSlotCount))
         return false;
+    if (g_writeback_presentation)
+        return PublishWritebackOutputSlot(slot, direct_slot_index);
     PresentationFrameSlot *direct_slot = &g_presentation_slots[direct_slot_index];
     ID3D12Resource *real_source = direct_slot->real_output.Get();
     ID3D12Resource *original_source = direct_slot->original_input.Get();
@@ -11478,12 +11591,12 @@ static void OnReshadeFinishEffects(reshade::api::effect_runtime *runtime,
     }
     if (ServiceNvofPipelineLiveness(nullptr))
     {
-        if (g_enabled && !g_neural_failed && g_nr_output && EnsureProxy(g_nr_output))
+        if (g_enabled && !g_neural_failed && g_nr_output && PresentationTargetReady(g_nr_output))
             g_pending_proxy_frame = true;
         return;
     }
     if (!ExecuteOnPresentPipeline(nullptr)) return;
-    if (!g_enabled || g_neural_failed || !g_nr_output || !EnsureProxy(g_nr_output)) return;
+    if (!g_enabled || g_neural_failed || !g_nr_output || !PresentationTargetReady(g_nr_output)) return;
     g_pending_proxy_frame = true;
 }
 
@@ -11584,6 +11697,301 @@ static bool OnReshadeOpenOverlay(reshade::api::effect_runtime *runtime, bool ope
         open ? "opened" : "closed", open ? "transparent" : "restored");
     return false;
 }
+
+// D3D11 write-back presentation. Two shared D3D12/D3D11 textures carry the
+// newest finished output into the game backbuffer: D3D12 copies into the back
+// texture while D3D11 shows the front one. Neither API ever waits on the
+// other's queue. Each side polls the other's fence on the CPU and acts only on
+// completed work, so no cross-API dependency can deadlock the GPU. (A GPU wait
+// from DXVK's D3D11 queue applies to its whole submission, which may also hold
+// the capture signal the D3D12 queue is waiting for.)
+struct WritebackBuffer
+{
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource12;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> resource11;
+    UINT64 copy_value = 0;  // D3D12 copy into this texture
+    UINT64 read_value = 0;  // newest D3D11 copy out of this texture
+    int slot = -1;          // presentation slot read by the in-flight copy
+};
+static WritebackBuffer g_writeback_buffers[2];
+static int g_writeback_front = -1;
+static Microsoft::WRL::ComPtr<ID3D12Fence> g_writeback_copy_fence;
+static Microsoft::WRL::ComPtr<ID3D11Fence> g_writeback_read_fence;
+static Microsoft::WRL::ComPtr<ID3D12CommandAllocator> g_writeback_allocator;
+static Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> g_writeback_list;
+static HANDLE g_writeback_fence_event;
+static UINT64 g_writeback_copy_counter;
+static UINT64 g_writeback_read_counter;
+static UINT g_writeback_width;
+static UINT g_writeback_height;
+static DXGI_FORMAT g_writeback_format = DXGI_FORMAT_UNKNOWN;
+static ULONGLONG g_writeback_frame_tick;
+static bool g_writeback_has_frame;
+// Past this age the last processed frame is no longer shown, so a stalled or
+// disabled pipeline falls back to the live game image instead of freezing it.
+static constexpr ULONGLONG kWritebackStaleMs = 250;
+
+static void ReleaseWritebackResources()
+{
+    if (g_writeback_copy_fence && g_writeback_copy_counter != 0 &&
+        g_writeback_copy_fence->GetCompletedValue() < g_writeback_copy_counter)
+    {
+        if (!g_writeback_fence_event)
+            g_writeback_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (g_writeback_fence_event && SUCCEEDED(g_writeback_copy_fence->SetEventOnCompletion(
+                g_writeback_copy_counter, g_writeback_fence_event)) &&
+            WaitForSingleObject(g_writeback_fence_event, 2000) != WAIT_OBJECT_0)
+            Log("write-back teardown timed out waiting for copy %llu", g_writeback_copy_counter);
+    }
+    for (WritebackBuffer &buffer : g_writeback_buffers)
+    {
+        ReleaseWritebackPresentationSlot(buffer.slot);
+        buffer = WritebackBuffer{};
+    }
+    int published[kWritebackPublishedSlots];
+    AcquireSRWLockExclusive(&g_writeback_slot_lock);
+    for (int index = 0; index < kWritebackPublishedSlots; ++index)
+    {
+        published[index] = g_writeback_published_slots[index];
+        g_writeback_published_slots[index] = -1;
+    }
+    ReleaseSRWLockExclusive(&g_writeback_slot_lock);
+    for (const int slot : published) ReleaseWritebackPresentationSlot(slot);
+    g_writeback_front = -1;
+    g_writeback_list.Reset(); g_writeback_allocator.Reset();
+    g_writeback_copy_fence.Reset(); g_writeback_read_fence.Reset();
+    g_writeback_copy_counter = g_writeback_read_counter = 0;
+    g_writeback_width = g_writeback_height = 0;
+    g_writeback_format = DXGI_FORMAT_UNKNOWN;
+    g_writeback_has_frame = false;
+}
+
+static bool EnsureWritebackResources(UINT width, UINT height, DXGI_FORMAT format)
+{
+    if (g_writeback_list && g_writeback_copy_fence && g_writeback_read_fence &&
+        g_writeback_buffers[1].resource11 &&
+        width == g_writeback_width && height == g_writeback_height && format == g_writeback_format)
+        return true;
+    ReleaseWritebackResources();
+    if (!g_neural_device || !g_legacy_device11 || !g_legacy_context4 || !g_command_queue) return false;
+    for (WritebackBuffer &buffer : g_writeback_buffers)
+    {
+        if (!CreateSharedPair11(width, height, format, buffer.resource12, buffer.resource11))
+        {
+            ReleaseWritebackResources();
+            return false;
+        }
+    }
+
+    Microsoft::WRL::ComPtr<ID3D12Device> device;
+    Microsoft::WRL::ComPtr<ID3D11Device5> device5;
+    HRESULT hr = g_command_queue->GetDevice(IID_PPV_ARGS(&device));
+    if (SUCCEEDED(hr)) hr = g_legacy_device11.As(&device5);
+    if (SUCCEEDED(hr)) hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_writeback_copy_fence));
+    if (SUCCEEDED(hr)) hr = device5->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_writeback_read_fence));
+    if (SUCCEEDED(hr)) hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+        IID_PPV_ARGS(&g_writeback_allocator));
+    if (SUCCEEDED(hr)) hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+        g_writeback_allocator.Get(), nullptr, IID_PPV_ARGS(&g_writeback_list));
+    if (SUCCEEDED(hr)) hr = g_writeback_list->Close();
+    if (FAILED(hr))
+    {
+        Log("write-back resource creation failed: %ux%u fmt=%u hr=0x%08X",
+            width, height, static_cast<unsigned int>(format), static_cast<unsigned int>(hr));
+        ReleaseWritebackResources();
+        return false;
+    }
+    g_writeback_width = width;
+    g_writeback_height = height;
+    g_writeback_format = format;
+    Log("write-back resources ready: 2x %ux%u fmt=%u", width, height, static_cast<unsigned int>(format));
+    return true;
+}
+
+// Takes the newest published slot that NGX has finished writing and returns
+// the older ones, which can no longer be shown. Newer unfinished slots stay.
+static int TakeWritebackCandidate()
+{
+    if (!g_neural_fence) return -1;
+    const UINT64 completed = g_neural_fence->GetCompletedValue();
+    int taken = -1;
+    int superseded[kWritebackPublishedSlots];
+    int superseded_count = 0;
+    bool any_published = false;
+    AcquireSRWLockExclusive(&g_writeback_slot_lock);
+    for (int index = kWritebackPublishedSlots - 1; index >= 0; --index)
+    {
+        const int slot = g_writeback_published_slots[index];
+        if (slot < 0) continue;
+        any_published = true;
+        if (taken < 0)
+        {
+            if (completed < g_presentation_slots[slot].neural_fence_value) continue;
+            taken = slot;
+        }
+        else
+            superseded[superseded_count++] = slot;
+        g_writeback_published_slots[index] = -1;
+    }
+    if (taken >= 0) ++g_writeback_taken;
+    else if (any_published) ++g_writeback_unfinished;
+    else ++g_writeback_empty;
+    ReleaseSRWLockExclusive(&g_writeback_slot_lock);
+    for (int index = 0; index < superseded_count; ++index)
+        ReleaseWritebackPresentationSlot(superseded[index]);
+    return taken;
+}
+
+// Records the D3D12 copy of a finished slot into one write-back texture.
+// Returns false (slot not consumed) when nothing was submitted.
+static bool CopyWritebackCandidate(ID3D11Texture2D *backbuffer, WritebackBuffer &buffer, int index)
+{
+    ID3D12Resource *source = g_presentation_slots[index].real_output.Get();
+    if (source == nullptr) return false;
+    D3D11_TEXTURE2D_DESC target = {};
+    backbuffer->GetDesc(&target);
+    const D3D12_RESOURCE_DESC output = source->GetDesc();
+    const DXGI_FORMAT format = TypedInputFormat(target.Format);
+    if (output.Width != target.Width || output.Height != target.Height ||
+        TypedInputFormat(output.Format) != format)
+    {
+        static std::atomic<unsigned long long> mismatches{0};
+        const unsigned long long count = ++mismatches;
+        if (count <= 4 || count % 600 == 0)
+            Log("write-back skipped: output %llux%u fmt=%u does not match backbuffer %ux%u fmt=%u (count=%llu)",
+                static_cast<unsigned long long>(output.Width), output.Height,
+                static_cast<unsigned int>(output.Format), target.Width, target.Height,
+                static_cast<unsigned int>(target.Format), count);
+        return false;
+    }
+    if (FAILED(g_writeback_allocator->Reset()) ||
+        FAILED(g_writeback_list->Reset(g_writeback_allocator.Get(), nullptr)))
+        return false;
+    ID3D12Resource *destination = buffer.resource12.Get();
+    const D3D12_RESOURCE_BARRIER begin[2] = {
+        Transition(source, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        Transition(destination, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
+    };
+    const D3D12_RESOURCE_BARRIER end[2] = {
+        Transition(source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+        Transition(destination, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON),
+    };
+    g_writeback_list->ResourceBarrier(2, begin);
+    g_writeback_list->CopyResource(destination, source);
+    g_writeback_list->ResourceBarrier(2, end);
+    if (FAILED(g_writeback_list->Close())) return false;
+    ID3D12CommandList *lists[] = { g_writeback_list.Get() };
+    g_command_queue->ExecuteCommandLists(1, lists);
+    // From here the slot is read by the GPU, so it stays owned by this texture
+    // even if the signal fails; teardown then waits out its bounded timeout.
+    buffer.slot = index;
+    const UINT64 copy_value = ++g_writeback_copy_counter;
+    if (FAILED(g_command_queue->Signal(g_writeback_copy_fence.Get(), copy_value)))
+    {
+        g_writeback_failed = true;
+        Log("write-back copy signal failed; write-back presentation disabled");
+        return true;
+    }
+    buffer.copy_value = copy_value;
+    return true;
+}
+
+// Called from the D3D11 Present path after the frame has been captured for
+// NGX, so the capture always reads the game's own image. ReShade effects and
+// the overlay are drawn after this event, on top of the processed frame.
+static void WritebackPresentedFrame(reshade::api::resource backbuffer_resource)
+{
+    if (!g_writeback_presentation || g_writeback_failed || !g_legacy_context4 || !g_command_queue) return;
+    auto *backbuffer = reinterpret_cast<ID3D11Texture2D *>(backbuffer_resource.handle);
+    if (backbuffer == nullptr) return;
+    // The NGX device appears a few Presents after the swapchain; nothing can
+    // be written back before then, and that is not a failure.
+    if (!g_neural_device || !g_legacy_device11) return;
+    D3D11_TEXTURE2D_DESC target = {};
+    backbuffer->GetDesc(&target);
+    if (!EnsureWritebackResources(target.Width, target.Height, TypedInputFormat(target.Format)))
+    {
+        g_writeback_failed = true;
+        SetStatus("write-back presentation unavailable; see log");
+        Log("write-back presentation disabled: resources unavailable for %ux%u fmt=%u",
+            target.Width, target.Height, static_cast<unsigned int>(target.Format));
+        return;
+    }
+
+    // Promote a finished copy to the front and return its source slot.
+    const UINT64 copies_done = g_writeback_copy_fence->GetCompletedValue();
+    for (int index = 0; index < 2; ++index)
+    {
+        WritebackBuffer &buffer = g_writeback_buffers[index];
+        if (buffer.slot < 0 || buffer.copy_value == 0 || copies_done < buffer.copy_value) continue;
+        const PresentationFrameSlot &slot = g_presentation_slots[buffer.slot];
+        if (slot.fg_fence_value != 0 && g_async_fg_fence &&
+            g_async_fg_fence->GetCompletedValue() < slot.fg_fence_value)
+            continue;
+        ReleaseWritebackPresentationSlot(buffer.slot);
+        buffer.slot = -1;
+        ++g_writeback_promoted;
+        g_writeback_front = index;
+        g_writeback_has_frame = true;
+        g_writeback_frame_tick = GetTickCount64();
+        UpdateOutputFps();
+        static std::atomic<bool> logged_first_frame{false};
+        if (!logged_first_frame.exchange(true, std::memory_order_acq_rel))
+            Log("write-back presentation active: %ux%u fmt=%u", target.Width, target.Height,
+                static_cast<unsigned int>(g_writeback_format));
+    }
+
+    // Copy the newest finished output into the back texture once D3D11 has
+    // finished reading it and no other copy is in flight (one allocator).
+    WritebackBuffer &back = g_writeback_buffers[g_writeback_front == 0 ? 1 : 0];
+    const bool copy_idle = g_writeback_buffers[0].slot < 0 && g_writeback_buffers[1].slot < 0;
+    const bool read_done = g_writeback_read_fence->GetCompletedValue() >= back.read_value;
+    ++g_writeback_presents;
+    if (!copy_idle) ++g_writeback_copy_busy;
+    else if (!read_done) ++g_writeback_read_busy;
+    const ULONGLONG stats_now = GetTickCount64();
+    if (g_writeback_stats_tick == 0) g_writeback_stats_tick = stats_now;
+    else if (stats_now - g_writeback_stats_tick >= 5000)
+    {
+        Log("write-back stats (5s): presents=%llu published=%llu taken=%llu unfinished=%llu empty=%llu copy_busy=%llu read_busy=%llu shown_new=%llu",
+            g_writeback_presents, g_writeback_published.exchange(0), g_writeback_taken,
+            g_writeback_unfinished, g_writeback_empty, g_writeback_copy_busy,
+            g_writeback_read_busy, g_writeback_promoted);
+        g_writeback_presents = g_writeback_taken = g_writeback_unfinished = g_writeback_empty = 0;
+        g_writeback_copy_busy = g_writeback_read_busy = g_writeback_promoted = 0;
+        g_writeback_stats_tick = stats_now;
+    }
+    if (copy_idle && read_done)
+    {
+        const int candidate = TakeWritebackCandidate();
+        if (candidate >= 0 && !CopyWritebackCandidate(backbuffer, back, candidate))
+            ReleaseWritebackPresentationSlot(candidate);
+    }
+
+    if (g_writeback_front < 0 || !g_writeback_has_frame || !g_show_neural_output || g_writeback_failed ||
+        GetTickCount64() - g_writeback_frame_tick > kWritebackStaleMs)
+        return;
+    WritebackBuffer &front = g_writeback_buffers[g_writeback_front];
+    g_legacy_context11->CopyResource(backbuffer, front.resource11.Get());
+    const UINT64 read_value = ++g_writeback_read_counter;
+    if (SUCCEEDED(g_legacy_context4->Signal(g_writeback_read_fence.Get(), read_value)))
+        front.read_value = read_value;
+    else
+    {
+        // Without the read signal the next copy could overwrite this texture
+        // while D3D11 still reads it.
+        g_writeback_failed = true;
+        Log("write-back read signal failed; write-back presentation disabled");
+    }
+}
+
+// Runs the write-back when the D3D11 Present path returns, whichever of its
+// capture branches it took.
+struct WritebackPresentScope
+{
+    reshade::api::resource backbuffer = { 0 };
+    ~WritebackPresentScope() { if (backbuffer.handle != 0) WritebackPresentedFrame(backbuffer); }
+};
 
 static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain,
     const reshade::api::rect *, const reshade::api::rect *, uint32_t, const reshade::api::rect *)
@@ -11947,13 +12355,13 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         if (!AdmitNewestFrameForFgPair())
         {
             if (DispatchCompletedNvofPipelineFrame(backbuffer) &&
-                g_nr_output != nullptr && EnsureProxy(g_nr_output))
+                g_nr_output != nullptr && PresentationTargetReady(g_nr_output))
                 g_pending_proxy_frame = true;
             return;
         }
         if (ServiceNvofPipelineLiveness(backbuffer))
         {
-            if (g_nr_output != nullptr && EnsureProxy(g_nr_output))
+            if (g_nr_output != nullptr && PresentationTargetReady(g_nr_output))
                 g_pending_proxy_frame = true;
             return;
         }
@@ -11966,6 +12374,8 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     }
     else if (api == reshade::api::device_api::d3d11 || api == reshade::api::device_api::d3d9)
     {
+        WritebackPresentScope writeback;
+        if (api == reshade::api::device_api::d3d11) writeback.backbuffer = backbuffer_resource;
         const auto desc = swapchain->get_device()->get_resource_desc(backbuffer_resource);
         const UINT width = static_cast<UINT>(desc.texture.width);
         const UINT height = desc.texture.height;
@@ -12033,7 +12443,7 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
             {
                 if (api == reshade::api::device_api::d3d11 &&
                     DispatchCompletedNvofPipelineFrame(nullptr) &&
-                    g_nr_output != nullptr && EnsureProxy(g_nr_output))
+                    g_nr_output != nullptr && PresentationTargetReady(g_nr_output))
                     g_pending_proxy_frame = true;
                 return;
             }
@@ -12042,7 +12452,7 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
             if (api == reshade::api::device_api::d3d11 && prepared_slot < 0)
             {
                 if (ServiceNvofPipelineLiveness(nullptr) &&
-                    g_nr_output != nullptr && EnsureProxy(g_nr_output))
+                    g_nr_output != nullptr && PresentationTargetReady(g_nr_output))
                 {
                     g_pending_proxy_frame = true;
                     return;
@@ -12089,7 +12499,7 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         SetStatus("Vulkan resources ready; waiting for ReShade effects boundary");
         return;
     }
-    if (g_nr_output != nullptr && EnsureProxy(g_nr_output)) g_pending_proxy_frame = true;
+    if (g_nr_output != nullptr && PresentationTargetReady(g_nr_output)) g_pending_proxy_frame = true;
 }
 
 static void BeginPrimarySwapchainTransition(HWND hwnd, UINT requested_width,
@@ -12596,6 +13006,19 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::TextWrapped("Mostly for Vulkan games. Try this when the addon initializes but the processed image is black, missing, stuck in the original window, or never replaces the game image. It displays the native output in a separate borderless window. Restart after changing it.");
     ImGui::Text("Automatic Vulkan output: %s",
         g_auto_detached_presentation_active.load() ? "active for this game" : "standing by");
+
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("WritebackPresentation", "Write processed output into the game image (D3D11, Wine/Proton)"), &g_writeback_presentation))
+    {
+        reshade::set_config_value(nullptr, section, "WritebackPresentation",
+            g_writeback_presentation ? "1" : "0");
+        SetStatus("write-back presentation changed; restart required");
+        Log("write-back presentation setting changed to %s; restart required",
+            g_writeback_presentation ? "enabled" : "disabled");
+    }
+    ImGui::TextWrapped("For D3D11 games where no proxy output can be shown, notably under Wine/Proton, which lack DirectComposition. Each finished frame is copied back into the game's own backbuffer, so ReShade effects and the menu are drawn on top of it. The output must match the backbuffer size; use the source resolution override to lower the NR cost. Restart after changing it.");
+    ImGui::Text("Write-back output: %s", g_writeback_failed ? "failed; see log" :
+        !g_writeback_presentation ? "disabled" :
+        g_writeback_has_frame ? "active" : (g_writeback_auto_wine ? "waiting (auto: Wine/Proton)" : "waiting"));
 
     if (ImGui::Checkbox(dlss5_aio_menu::Label("HideDetachedSystemCursor", "Hide detached Windows cursor"), &g_hide_detached_system_cursor))
     {
@@ -13319,6 +13742,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             reshade::set_config_value(nullptr, section, "WindowedVirtualization", "1");
         }
         read_setting("DetachedPresentation", "0", value, sizeof(value)); g_detached_presentation = strcmp(value, "0") != 0;
+        read_setting("WritebackPresentation", "auto", value, sizeof(value));
+        g_writeback_auto_wine = strcmp(value, "auto") == 0 && RunningUnderWine();
+        g_writeback_presentation = g_writeback_auto_wine ||
+            (strcmp(value, "auto") != 0 && strcmp(value, "0") != 0);
         read_setting("HideDetachedSystemCursor", "0", value, sizeof(value)); g_hide_detached_system_cursor = strcmp(value, "0") != 0;
         read_setting("OpaqueComposition", "0", value, sizeof(value)); g_opaque_composition = strcmp(value, "0") != 0;
         read_setting("SynchronousProxyPresentation", "0", value, sizeof(value)); g_synchronous_proxy_presentation = strcmp(value, "0") != 0;
@@ -13348,6 +13775,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             g_opaque_composition ? "enabled" : "disabled",
             g_synchronous_proxy_presentation ? "serialized" : "asynchronous",
             g_performance_telemetry_enabled ? "enabled" : "disabled");
+        Log("write-back presentation: %s",
+            g_writeback_auto_wine ? "enabled automatically (Wine/Proton detected)" :
+            g_writeback_presentation ? "enabled" : "disabled");
         Log("NVIDIA Optical Flow prototype: requested=%s resolution=%s consistency=%.1fpx cost=%.2f (default on)",
             g_nvof_motion_enabled ? "enabled" : "disabled",
             NvofResolutionModeName(g_nvof_resolution_mode),

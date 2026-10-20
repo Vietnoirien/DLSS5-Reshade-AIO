@@ -114,6 +114,8 @@ inline constexpr NRSetting kSettings[] = {
       "Try when the detected native resolution is wrong because of Windows display scaling. Restart required.", Group::Compatibility },
     { "DetachedPresentation", "Detached native output (Vulkan compatibility)", NR_BOOL, 0, 0, 1, nullptr, nullptr, 0,
       "Try when processed output is black, missing, or trapped inside the original game window. Restart required.", Group::Compatibility },
+    { "WritebackPresentation", "Write processed output into the game image (D3D11, Wine/Proton)", NR_BOOL, 0, 0, 1, nullptr, nullptr, 0,
+      "Copies each finished frame back into the game's own backbuffer instead of using a proxy compositor. On by default under Wine/Proton. Restart required.", Group::Compatibility },
     { "HideDetachedSystemCursor", "Hide detached Windows cursor", NR_BOOL, 0, 0, 1, nullptr, nullptr, 0,
       "Force-hides a duplicate system cursor when the game does not report cursor visibility correctly.", Group::Compatibility },
     { "OpaqueComposition", "Opaque attached composition", NR_BOOL, 0, 0, 1, nullptr, nullptr, 0,
