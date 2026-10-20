@@ -11737,13 +11737,14 @@ static UINT g_writeback_height;
 static DXGI_FORMAT g_writeback_format = DXGI_FORMAT_UNKNOWN;
 static ULONGLONG g_writeback_frame_tick;
 static bool g_writeback_has_frame;
-// Frame generation: the front frame's generated image is shown once, through
-// an extra native Present, half a frame before its real image.
+// Frame generation: with FG the pipeline processes about every second game
+// frame. Each new frame's generated image (between the previous real frame
+// and this one) takes the game Present on which the frame arrives, and its
+// real image the next Present, so every Present shows one evenly spaced,
+// unique image. No new frame is promoted while a real image is still due.
 static bool g_writeback_with_generated;
-static bool g_writeback_generated_pending;
-static bool g_writeback_fg_failed;
-static LARGE_INTEGER g_writeback_last_present_qpc;
-static double g_writeback_interval_us;
+static bool g_writeback_generated_due;
+static bool g_writeback_real_due;
 static unsigned long long g_writeback_generated_shown;
 // Past this age the last processed frame is no longer shown, so a stalled or
 // disabled pipeline falls back to the live game image instead of freezing it.
@@ -11783,12 +11784,13 @@ static void ReleaseWritebackResources()
     g_writeback_format = DXGI_FORMAT_UNKNOWN;
     g_writeback_has_frame = false;
     g_writeback_with_generated = false;
-    g_writeback_generated_pending = false;
+    g_writeback_generated_due = false;
+    g_writeback_real_due = false;
 }
 
 static bool EnsureWritebackResources(UINT width, UINT height, DXGI_FORMAT format)
 {
-    const bool with_generated = EffectiveFramegenEnabled() && !g_framegen_failed && !g_writeback_fg_failed;
+    const bool with_generated = EffectiveFramegenEnabled() && !g_framegen_failed;
     if (g_writeback_list && g_writeback_copy_fence && g_writeback_read_fence &&
         g_writeback_buffers[kWritebackBufferCount - 1].resource11 &&
         g_writeback_with_generated == with_generated &&
@@ -11944,62 +11946,11 @@ static bool CopyWritebackCandidate(ID3D11Texture2D *backbuffer, WritebackBuffer 
 // Called from the D3D11 Present path after the frame has been captured for
 // NGX, so the capture always reads the game's own image. ReShade effects and
 // the overlay are drawn after this event, on top of the processed frame.
-// Shows the front frame's generated image through an extra native Present and
-// waits until half a frame later, so the caller's real image follows evenly.
-// The native swapchain is ReShade's wrapped object, so this does not re-enter
-// ReShade's own Present handling.
-static void PresentWritebackGeneratedFrame(reshade::api::swapchain *swapchain,
-    ID3D11Texture2D *backbuffer, WritebackBuffer &front)
-{
-    auto *native = swapchain ? reinterpret_cast<IDXGISwapChain *>(swapchain->get_native()) : nullptr;
-    if (native == nullptr) return;
-    g_legacy_context11->CopyResource(backbuffer, front.generated11.Get());
-    LARGE_INTEGER presented = {}, frequency = {};
-    QueryPerformanceFrequency(&frequency);
-    const HRESULT hr = native->Present(0, 0);
-    QueryPerformanceCounter(&presented);
-    if (FAILED(hr))
-    {
-        g_writeback_fg_failed = true;
-        Log("write-back generated-frame Present failed: 0x%08X; frame generation write-back disabled",
-            static_cast<unsigned int>(hr));
-        return;
-    }
-    ++g_writeback_generated_shown;
-    static std::atomic<bool> logged_first_generated{false};
-    if (!logged_first_generated.exchange(true, std::memory_order_acq_rel))
-        Log("write-back frame generation active: generated frames are presented between real frames");
-    // Half the measured real-frame interval, bounded so a slow frame cannot
-    // stall the game thread for long.
-    const double wait_us = std::clamp(g_writeback_interval_us * 0.5, 0.0, 25000.0);
-    const LONGLONG target = presented.QuadPart +
-        static_cast<LONGLONG>(wait_us * static_cast<double>(frequency.QuadPart) / 1000000.0);
-    for (LARGE_INTEGER now = presented; now.QuadPart < target; QueryPerformanceCounter(&now))
-    {
-        const double remaining_us = static_cast<double>(target - now.QuadPart) * 1000000.0 /
-            static_cast<double>(frequency.QuadPart);
-        if (remaining_us > 1500.0) Sleep(1);
-        else YieldProcessor();
-    }
-}
-
-static void WritebackPresentedFrame(reshade::api::swapchain *swapchain, reshade::api::resource backbuffer_resource)
+static void WritebackPresentedFrame(reshade::api::resource backbuffer_resource)
 {
     if (!g_writeback_presentation || g_writeback_failed || !g_legacy_context4 || !g_command_queue) return;
     auto *backbuffer = reinterpret_cast<ID3D11Texture2D *>(backbuffer_resource.handle);
     if (backbuffer == nullptr) return;
-    // Smoothed real-frame interval, used to pace generated frames.
-    LARGE_INTEGER present_now = {};
-    QueryPerformanceCounter(&present_now);
-    if (g_writeback_last_present_qpc.QuadPart != 0)
-    {
-        const double interval_us = static_cast<double>(
-            CounterDeltaMicroseconds(g_writeback_last_present_qpc, present_now));
-        if (interval_us > 0.0 && interval_us < 250000.0)
-            g_writeback_interval_us = g_writeback_interval_us == 0.0 ? interval_us :
-                g_writeback_interval_us * 0.9 + interval_us * 0.1;
-    }
-    g_writeback_last_present_qpc = present_now;
     // The NGX device appears a few Presents after the swapchain; nothing can
     // be written back before then, and that is not a failure.
     if (!g_neural_device || !g_legacy_device11) return;
@@ -12014,9 +11965,10 @@ static void WritebackPresentedFrame(reshade::api::swapchain *swapchain, reshade:
         return;
     }
 
-    // Promote a finished copy to the front and return its source slot.
+    // Promote a finished copy to the front and return its source slot, unless
+    // the current front still owes its real image after its generated one.
     const UINT64 copies_done = g_writeback_copy_fence->GetCompletedValue();
-    for (int index = 0; index < kWritebackBufferCount; ++index)
+    for (int index = 0; index < kWritebackBufferCount && !g_writeback_real_due; ++index)
     {
         WritebackBuffer &buffer = g_writeback_buffers[index];
         if (buffer.slot < 0 || buffer.copy_value == 0 || copies_done < buffer.copy_value) continue;
@@ -12028,7 +11980,7 @@ static void WritebackPresentedFrame(reshade::api::swapchain *swapchain, reshade:
         buffer.slot = -1;
         ++g_writeback_promoted;
         g_writeback_front = index;
-        g_writeback_generated_pending = buffer.has_generated;
+        g_writeback_generated_due = buffer.has_generated;
         g_writeback_has_frame = true;
         g_writeback_frame_tick = GetTickCount64();
         UpdateOutputFps();
@@ -12078,19 +12030,28 @@ static void WritebackPresentedFrame(reshade::api::swapchain *swapchain, reshade:
 
     if (g_writeback_front < 0 || !g_writeback_has_frame || !g_show_neural_output || g_writeback_failed ||
         GetTickCount64() - g_writeback_frame_tick > kWritebackStaleMs)
-        return;
-    WritebackBuffer &front = g_writeback_buffers[g_writeback_front];
-    // The generated image goes out once per new frame. It is skipped while the
-    // ReShade menu is open, since only the real frame carries the overlay.
-    if (g_writeback_generated_pending)
     {
-        g_writeback_generated_pending = false;
-        if (front.has_generated && front.generated11 && !g_writeback_fg_failed &&
-            EffectiveFramegenEnabled() && !g_framegen_failed &&
-            !g_reshade_overlay_open.load(std::memory_order_acquire))
-            PresentWritebackGeneratedFrame(swapchain, backbuffer, front);
+        g_writeback_generated_due = g_writeback_real_due = false;
+        return;
     }
-    g_legacy_context11->CopyResource(backbuffer, front.resource11.Get());
+    WritebackBuffer &front = g_writeback_buffers[g_writeback_front];
+    // A new frame shows its generated image first; its real image follows on
+    // the next Present. Generated images are skipped while the ReShade menu is
+    // open, since the overlay is part of what the player is looking at.
+    const bool show_generated = g_writeback_generated_due && !g_writeback_real_due &&
+        front.has_generated && front.generated11 && EffectiveFramegenEnabled() && !g_framegen_failed &&
+        !g_reshade_overlay_open.load(std::memory_order_acquire);
+    g_writeback_generated_due = false;
+    g_writeback_real_due = show_generated;
+    if (show_generated)
+    {
+        ++g_writeback_generated_shown;
+        static std::atomic<bool> logged_first_generated{false};
+        if (!logged_first_generated.exchange(true, std::memory_order_acq_rel))
+            Log("write-back frame generation active: generated and real frames alternate on game Presents");
+    }
+    g_legacy_context11->CopyResource(backbuffer,
+        show_generated ? front.generated11.Get() : front.resource11.Get());
     const UINT64 read_value = ++g_writeback_read_counter;
     if (SUCCEEDED(g_legacy_context4->Signal(g_writeback_read_fence.Get(), read_value)))
         front.read_value = read_value;
@@ -12107,9 +12068,8 @@ static void WritebackPresentedFrame(reshade::api::swapchain *swapchain, reshade:
 // capture branches it took.
 struct WritebackPresentScope
 {
-    reshade::api::swapchain *swapchain = nullptr;
     reshade::api::resource backbuffer = { 0 };
-    ~WritebackPresentScope() { if (backbuffer.handle != 0) WritebackPresentedFrame(swapchain, backbuffer); }
+    ~WritebackPresentScope() { if (backbuffer.handle != 0) WritebackPresentedFrame(backbuffer); }
 };
 
 static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain,
@@ -12494,11 +12454,7 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     else if (api == reshade::api::device_api::d3d11 || api == reshade::api::device_api::d3d9)
     {
         WritebackPresentScope writeback;
-        if (api == reshade::api::device_api::d3d11)
-        {
-            writeback.swapchain = swapchain;
-            writeback.backbuffer = backbuffer_resource;
-        }
+        if (api == reshade::api::device_api::d3d11) writeback.backbuffer = backbuffer_resource;
         const auto desc = swapchain->get_device()->get_resource_desc(backbuffer_resource);
         const UINT width = static_cast<UINT>(desc.texture.width);
         const UINT height = desc.texture.height;
